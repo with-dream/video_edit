@@ -18,7 +18,7 @@ link_directories(
 
 add_executable(${pro}
         main.cpp
-        Slice.cpp Slice.h)
+        tools/Slice.cpp tools/Slice.h tools/Transcode.cpp tools/Transcode.h)
 
 target_link_libraries(${pro}
         avfilter

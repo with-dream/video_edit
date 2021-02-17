@@ -10,7 +10,7 @@ class Slice {
 private:
 
 public:
-    int slice(const char *, long start, long end);
+    int slice(const char *, float start, float end, const char *);
 
 };
 
