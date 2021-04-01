@@ -5,7 +5,6 @@ set(pro video_edit)
 project(${pro})
 
 set(CMAKE_CXX_STANDARD 14)
-set(ffmpeg_path /Users/ms/share/project/modules/ffmpeg/ffmpeg)
 
 include_directories(
         /usr/local/include
@@ -16,9 +15,16 @@ link_directories(
         /usr/local/lib/
 )
 
-add_executable(${pro}
+set(src_list
+#        examples/decode_video.c
+#        examples/transcoding.c
         main.cpp
-        tools/Slice.cpp tools/Slice.h tools/Transcode.cpp tools/Transcode.h)
+#        tools/Slice.cpp
+#        tools/Transcode.cpp
+        D.cpp D.h)
+
+add_executable(${pro}
+        ${src_list})
 
 target_link_libraries(${pro}
         avfilter
