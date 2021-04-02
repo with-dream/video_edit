@@ -36,6 +36,15 @@ extern "C" {
 #include <libavutil/pixdesc.h>
 }
 
+typedef struct filter_context {
+    AVFilterContext *buffersink_ctx;
+    AVFilterContext *buffersrc_ctx;
+    AVFilterGraph *filter_graph;
+
+    AVPacket *enc_pkt;
+    AVFrame *filtered_frame;
+} filter_context;
+
 typedef struct _media_param {
     int width;
     int height;
@@ -59,6 +68,7 @@ typedef struct _media_info {
     AVCodecContext *avctx[AVMEDIA_TYPE_NB];
     AVFrame *frame[AVMEDIA_TYPE_NB];
     AVPacket *packet[AVMEDIA_TYPE_NB];
+    filter_context *fc;
 
     char *video_codec_name;
     char *audio_codec_name;
@@ -79,6 +89,191 @@ typedef struct _TT {
     int input_index;
     int output_index;
 } TT;
+
+
+static int init_filter(filter_context *fctx, AVCodecContext *dec_ctx,
+                       AVCodecContext *enc_ctx, const char *filter_spec) {
+    char args[512];
+    int ret = 0;
+    const AVFilter *buffersrc = NULL;
+    const AVFilter *buffersink = NULL;
+    AVFilterContext *buffersrc_ctx = NULL;
+    AVFilterContext *buffersink_ctx = NULL;
+    AVFilterInOut *outputs = avfilter_inout_alloc();
+    AVFilterInOut *inputs = avfilter_inout_alloc();
+    AVFilterGraph *filter_graph = avfilter_graph_alloc();
+
+    if (!outputs || !inputs || !filter_graph) {
+        ret = AVERROR(ENOMEM);
+        goto end;
+    }
+
+    if (dec_ctx->codec_type == AVMEDIA_TYPE_VIDEO) {
+        buffersrc = avfilter_get_by_name("buffer");
+        buffersink = avfilter_get_by_name("buffersink");
+        if (!buffersrc || !buffersink) {
+            av_log(NULL, AV_LOG_ERROR, "filtering source or sink element not found\n");
+            ret = AVERROR_UNKNOWN;
+            goto end;
+        }
+
+        snprintf(args, sizeof(args),
+                 "video_size=%dx%d:pix_fmt=%d:time_base=%d/%d:pixel_aspect=%d/%d",
+                 dec_ctx->width, dec_ctx->height, dec_ctx->pix_fmt,
+                 dec_ctx->time_base.num, dec_ctx->time_base.den,
+                 dec_ctx->sample_aspect_ratio.num,
+                 dec_ctx->sample_aspect_ratio.den);
+
+        ret = avfilter_graph_create_filter(&buffersrc_ctx, buffersrc, "in",
+                                           args, NULL, filter_graph);
+        if (ret < 0) {
+            av_log(NULL, AV_LOG_ERROR, "Cannot create buffer source\n");
+            goto end;
+        }
+
+        ret = avfilter_graph_create_filter(&buffersink_ctx, buffersink, "out",
+                                           NULL, NULL, filter_graph);
+        if (ret < 0) {
+            av_log(NULL, AV_LOG_ERROR, "Cannot create buffer sink\n");
+            goto end;
+        }
+
+        ret = av_opt_set_bin(buffersink_ctx, "pix_fmts",
+                             (uint8_t *) &enc_ctx->pix_fmt, sizeof(enc_ctx->pix_fmt),
+                             AV_OPT_SEARCH_CHILDREN);
+        if (ret < 0) {
+            av_log(NULL, AV_LOG_ERROR, "Cannot set output pixel format\n");
+            goto end;
+        }
+    } else if (dec_ctx->codec_type == AVMEDIA_TYPE_AUDIO) {
+        buffersrc = avfilter_get_by_name("abuffer");
+        buffersink = avfilter_get_by_name("abuffersink");
+        if (!buffersrc || !buffersink) {
+            av_log(NULL, AV_LOG_ERROR, "filtering source or sink element not found\n");
+            ret = AVERROR_UNKNOWN;
+            goto end;
+        }
+
+        if (!dec_ctx->channel_layout)
+            dec_ctx->channel_layout =
+                    av_get_default_channel_layout(dec_ctx->channels);
+        snprintf(args, sizeof(args),
+                 "time_base=%d/%d:sample_rate=%d:sample_fmt=%s:channel_layout=0x%" PRIx64,
+                 dec_ctx->time_base.num, dec_ctx->time_base.den, dec_ctx->sample_rate,
+                 av_get_sample_fmt_name(dec_ctx->sample_fmt),
+                 dec_ctx->channel_layout);
+        ret = avfilter_graph_create_filter(&buffersrc_ctx, buffersrc, "in",
+                                           args, NULL, filter_graph);
+        if (ret < 0) {
+            av_log(NULL, AV_LOG_ERROR, "Cannot create audio buffer source\n");
+            goto end;
+        }
+
+        ret = avfilter_graph_create_filter(&buffersink_ctx, buffersink, "out",
+                                           NULL, NULL, filter_graph);
+        if (ret < 0) {
+            av_log(NULL, AV_LOG_ERROR, "Cannot create audio buffer sink\n");
+            goto end;
+        }
+
+        ret = av_opt_set_bin(buffersink_ctx, "sample_fmts",
+                             (uint8_t *) &enc_ctx->sample_fmt, sizeof(enc_ctx->sample_fmt),
+                             AV_OPT_SEARCH_CHILDREN);
+        if (ret < 0) {
+            av_log(NULL, AV_LOG_ERROR, "Cannot set output sample format\n");
+            goto end;
+        }
+
+        ret = av_opt_set_bin(buffersink_ctx, "channel_layouts",
+                             (uint8_t *) &enc_ctx->channel_layout,
+                             sizeof(enc_ctx->channel_layout), AV_OPT_SEARCH_CHILDREN);
+        if (ret < 0) {
+            av_log(NULL, AV_LOG_ERROR, "Cannot set output channel layout\n");
+            goto end;
+        }
+
+        ret = av_opt_set_bin(buffersink_ctx, "sample_rates",
+                             (uint8_t *) &enc_ctx->sample_rate, sizeof(enc_ctx->sample_rate),
+                             AV_OPT_SEARCH_CHILDREN);
+        if (ret < 0) {
+            av_log(NULL, AV_LOG_ERROR, "Cannot set output sample rate\n");
+            goto end;
+        }
+    } else {
+        ret = AVERROR_UNKNOWN;
+        goto end;
+    }
+
+    /* Endpoints for the filter graph. */
+    outputs->name = av_strdup("in");
+    outputs->filter_ctx = buffersrc_ctx;
+    outputs->pad_idx = 0;
+    outputs->next = NULL;
+
+    inputs->name = av_strdup("out");
+    inputs->filter_ctx = buffersink_ctx;
+    inputs->pad_idx = 0;
+    inputs->next = NULL;
+
+    if (!outputs->name || !inputs->name) {
+        ret = AVERROR(ENOMEM);
+        goto end;
+    }
+
+    if ((ret = avfilter_graph_parse_ptr(filter_graph, filter_spec,
+                                        &inputs, &outputs, NULL)) < 0)
+        goto end;
+
+    if ((ret = avfilter_graph_config(filter_graph, NULL)) < 0)
+        goto end;
+
+    /* Fill FilteringContext */
+    fctx->buffersrc_ctx = buffersrc_ctx;
+    fctx->buffersink_ctx = buffersink_ctx;
+    fctx->filter_graph = filter_graph;
+
+    end:
+    avfilter_inout_free(&inputs);
+    avfilter_inout_free(&outputs);
+
+    return ret;
+}
+
+static int init_filters(media_info *input, media_info *output) {
+    const char *filter_spec;
+    unsigned int i;
+    int ret;
+    input->fc = (filter_context *) av_malloc_array(input->ic->nb_streams, sizeof(*input->fc));
+    if (!input->fc)
+        return AVERROR(ENOMEM);
+
+    for (i = 0; i < input->ic->nb_streams; i++) {
+        input->fc[i].buffersrc_ctx = NULL;
+        input->fc[i].buffersink_ctx = NULL;
+        input->fc[i].filter_graph = NULL;
+        if (!(input->ic->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO
+              || input->ic->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO))
+            continue;
+
+        if (input->ic->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO)
+            filter_spec = "null"; /* passthrough (dummy) filter for video */
+        else
+            filter_spec = "anull"; /* passthrough (dummy) filter for audio */
+        ret = init_filter(input->fc, input->avctx[i],
+                          output->avctx[i], filter_spec);
+        if (ret)
+            return ret;
+
+        input->fc[i].enc_pkt = av_packet_alloc();
+        if (!input->fc[i].enc_pkt)
+            return AVERROR(ENOMEM);
+
+        input->fc[i].filtered_frame = av_frame_alloc();
+        if (!input->fc[i].filtered_frame)
+            return AVERROR(ENOMEM);
+    }
+    return 0;
+}
 
 static int init_avctx(media_info *info, AVStream *stream, media_param *param, bool decode) {
     char *force_codec = nullptr;
@@ -316,7 +511,7 @@ int main(int argc, char **argv) {
 
     media_info *out_info = (media_info *) malloc(sizeof(media_info));
     memset(out_info, 0, sizeof(out_info));
-    out_info->file_name = "/Users/ms/Desktop/ss.mkv";
+    out_info->file_name = "/Users/ms/Desktop/ss.mov";
     ctx->output_media[0] = out_info;
 
     for (int i = 0; i < sizeof(ctx->input_media) / sizeof(ctx->input_media[0]); i++)
@@ -354,6 +549,8 @@ int main(int argc, char **argv) {
         if (open_output_file(ctx->output_media[i], param) < 0)
             return -1;
     }
+
+    init_filters(input_info, out_info);
 
     //解码
     int ret = -1;
